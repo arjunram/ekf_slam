@@ -29,6 +29,7 @@ public:
   {
     imu_sub_ = n_.subscribe("imu/data_raw", 1000, &EkfSlamNode::imuCallback, this);
     apriltag_sub_ = n_.subscribe("tag_detections", 10, &EkfSlamNode::apriltagCallback, this);
+    pose_pub_ = n_.advertise<geometry_msgs::PoseWithCovarianceStamped>("robot_pose", 1000);
     initialize_();
   }
 
@@ -37,7 +38,7 @@ public:
     num_state_ = 5;
     num_features_ = 0;
     state_ = VectorXd::Zero(num_state_);
-    state_.head(3) = Matrix<double,3,1>(-0.85, 0.2, 0);
+    
     global_state_ = VectorXd::Zero(num_state_);
     cov_ = MatrixXd::Zero(num_state_,num_state_);
     F = MatrixXd::Zero(num_state_,num_state_);
@@ -45,11 +46,14 @@ public:
     last_imu_ = ros::Time::now();
     ROS_INFO_STREAM(last_imu_.toSec());
     imu_dt_ = 0;
-    Q_ << 0.0001, 0,      0,
-          0,      0.0001, 0,
-          0,      0,      0.00001;
-    R_ << 0.05, 0,
-          0,    0.001;
+    state_.head(3) = Matrix<double,3,1>(-0.85, 0.2, 0);
+    Q_ << 0.1, 0,      0,
+          0,      0.1, 0,
+          0,      0,      0.1;
+    R_ << 0.005, 0,
+          0,    0.0001;
+    bx_ = -0.1391;
+    by_ = 0.2746;
     ROS_INFO_STREAM("Initialized");
   }
 
@@ -61,7 +65,7 @@ public:
       for (int i = 0;i<tag->detections.size();i++)
       {
         tag_pose = tag->detections[i].pose.pose.pose;
-        update_state_(tag->detections[i].id[0], tag_pose);
+        //update_state_(tag->detections[i].id[0], tag_pose);
       }
       
 
@@ -86,13 +90,16 @@ public:
     
   }
 
+  void publish_state();
 
 private:
   ros::Subscriber apriltag_sub_;
   ros::Subscriber imu_sub_;
+  ros::Publisher pose_pub_;
   ros::NodeHandle n_;
   ros::Time last_imu_;
   double imu_dt_;
+  double bx_,by_;
   int num_state_;
   int num_features_;
   Eigen::VectorXd state_, global_state_;
@@ -112,42 +119,42 @@ void EkfSlamNode::update_dt_(sensor_msgs::Imu msg)
   ros::Duration dt = msg.header.stamp - last_imu_;
   last_imu_ = msg.header.stamp;
   imu_dt_ = dt.toSec();
-  if (imu_dt_>0.1 || imu_dt_<0)    imu_dt_ = 0;
-  ROS_INFO_STREAM("dt updated");
+  if (imu_dt_>0.1 || imu_dt_<0) imu_dt_ = 0;
   
 }
 
 void EkfSlamNode::propagate_state_(sensor_msgs::Imu msg)
 {
-  
-  double ax = msg.linear_acceleration.x;
-  double ay = msg.linear_acceleration.y;
+  //ROS_INFO_STREAM("Prop");
+  double ax = msg.linear_acceleration.x - bx_;
+  double ay = msg.linear_acceleration.y - by_; 
   double w = msg.angular_velocity.z;
+  //imu_dt_ = 0.01;
   Eigen::Vector3d u(ax,ay,w);
-  double theta = state_(3);
+  double theta = state_(2);
+  //theta = 0;
   //ROS_INFO_STREAM("dt="<<imu_dt_<<" ax="<<ax<<" ay="<<ay<<" w="<<w<<" theta="<<theta);
   Eigen::Matrix2d ThetaLocalToGlobalDCM, ThetaGlobalToLocalDCM, wLocalToGlobalDCM, wGlobalToLocalDCM;
   ThetaLocalToGlobalDCM << cos(theta), -sin(theta), sin(theta), cos(theta);
   ThetaGlobalToLocalDCM = ThetaLocalToGlobalDCM.transpose();
   wLocalToGlobalDCM << cos(w*imu_dt_), -sin(w*imu_dt_), sin(w*imu_dt_), cos(w*imu_dt_);
   wGlobalToLocalDCM = wLocalToGlobalDCM.transpose();
-
   F.block(0,0,5,5) = MatrixXd::Identity(5,5);
   F.block(0,3,2,2) = imu_dt_*ThetaLocalToGlobalDCM;
   B.block(0,0,2,2) = 0.5*imu_dt_*imu_dt_*ThetaLocalToGlobalDCM;
   B(2,2) = imu_dt_;
   B.block(3,0,2,2) = imu_dt_*ThetaLocalToGlobalDCM;
-
   for(int i = 0;i<num_features_;i++)
   {
     F.block(5+i*2,3,2,2) = imu_dt_*wLocalToGlobalDCM;
     F.block(5+i*2,5+i*2,2,2) = wGlobalToLocalDCM;
     B.block(5+i*2,0,2,2) = 0.5*imu_dt_*imu_dt_*wLocalToGlobalDCM;
   }
-  ROS_INFO_STREAM("F: "<<F.rows()<<" "<<F.cols()<<" B:"<<B.rows()<<" "<<B.cols()<<" s:"<<state_.size()<<" cov:"<<cov_.rows()<<" "<<cov_.cols()<<endl);
+  
   state_ = F*state_ + B*u;
   cov_ = F*cov_*F.transpose() + B*Q_*B.transpose();
-  ROS_INFO_STREAM("Propagated");
+  ROS_INFO_STREAM(imu_dt_<<" "<<u.transpose()<<endl<<B*u<<endl<<state_);
+  //ROS_INFO_STREAM("XY:"<<state_(1)<<" "<<state_(2)<<" "<<state_(3)<<" "<<state_(4)<<" "<<state_(5)<<endl);
 }
 
 void EkfSlamNode::expand_state_()
@@ -164,7 +171,8 @@ void EkfSlamNode::expand_state_()
   F = temp;
   num_state_+= 2;
   num_features_ += 1;
-  ROS_INFO_STREAM("Expanded "<<num_state_<<" "<<num_features_);
+  B = MatrixXd::Zero(num_state_,3);
+  //ROS_INFO_STREAM("Expanded "<<num_state_<<" "<<num_features_);
 }
 
 void EkfSlamNode::update_state_(int id, geometry_msgs::Pose tag_pose)
@@ -182,6 +190,7 @@ void EkfSlamNode::update_state_(int id, geometry_msgs::Pose tag_pose)
     state_(3+num_features_*2) = r*sin(theta);
     state_(4+num_features_*2) = r*cos(theta);
     ROS_INFO_STREAM(x<<" "<<z<<" "<<r<<" "<<theta<<" state "<<state_);
+    ROS_INFO_STREAM("Added");
   }
   else
   {
@@ -204,9 +213,29 @@ void EkfSlamNode::update_state_(int id, geometry_msgs::Pose tag_pose)
     MatrixXd I_KH(MatrixXd::Identity(num_state_,num_state_) - K*jH);
     cov_ = I_KH*cov_*I_KH.transpose() + K*R_*K.transpose();
   }
-
 }
 
+void EkfSlamNode::publish_state()
+{
+  geometry_msgs::PoseWithCovarianceStamped pose;
+  std_msgs::Header h;
+  h.stamp = ros::Time::now();
+  pose.header = h;
+  for(int i = 0;i<3;i++)
+  {
+
+    for(int j = 0;j<3;j++)
+    {
+      pose.pose.covariance[i+3*j] = cov_(i,j);
+      //cout<<cov_(i,j)<<" ";
+    }
+    //cout<<endl;
+  }
+  pose.pose.pose.position.x = state_(0);
+  pose.pose.pose.position.y = state_(1);
+  pose.pose.pose.position.z = state_(2);
+  pose_pub_.publish(pose);
+}
 
 int main(int argc, char **argv)
 {
@@ -215,8 +244,13 @@ int main(int argc, char **argv)
   ros::init(argc, argv, "ekf_slam");
   EkfSlamNode obj;
   ROS_INFO("Running");
-
-  ros::spin();
-  
+  //ros::spin();
+  ros:Rate loop_rate(10);
+  while(ros::ok())
+  {
+    obj.publish_state();
+    ros::spinOnce();
+    loop_rate.sleep();
+  } 
   return 0;
 }
